@@ -57,6 +57,9 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to fetch agent %q: %w", name, err)
 	}
+	if agentModel == nil {
+		return fmt.Errorf("agent not found: %s (version %s)", name, version)
+	}
 
 	manifest := &agentModel.Agent.AgentManifest
 
@@ -111,7 +114,7 @@ func buildDeployConfig(manifest *common.AgentManifest) map[string]string {
 
 // deployLocal deploys an agent to the local/docker runtime
 func deployLocal(name, version string, config map[string]string) error {
-	deployment, err := apiClient.DeployAgent(name, version, config)
+	deployment, err := apiClient.DeployAgent(name, version, config, "local")
 	if err != nil {
 		return fmt.Errorf("failed to deploy agent: %w", err)
 	}
@@ -122,12 +125,13 @@ func deployLocal(name, version string, config map[string]string) error {
 
 // deployKubernetes deploys an agent to the kubernetes runtime
 func deployKubernetes(name, version string, config map[string]string) error {
-	// TODO: Implement kubernetes deployment logic
-	// This would involve:
-	// 1. Creating kubernetes manifests (Deployment, Service, ConfigMap, etc.)
-	// 2. Applying them to the cluster
-	// 3. Waiting for the deployment to be ready
-	return fmt.Errorf("kubernetes runtime deployment is not yet implemented")
+	deployment, err := apiClient.DeployAgent(name, version, config, "kubernetes")
+	if err != nil {
+		return fmt.Errorf("failed to deploy agent: %w", err)
+	}
+
+	fmt.Printf("Agent '%s' version '%s' deployed to kubernetes runtime\n", deployment.ServerName, deployment.Version)
+	return nil
 }
 
 func init() {

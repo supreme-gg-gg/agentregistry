@@ -91,7 +91,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 
 	// Deploy server via API (server will handle reconciliation)
 	fmt.Println("\nDeploying server...")
-	deployment, err := apiClient.DeployServer(server.Server.Name, deployVersion, config, deployPreferRemote)
+	deployment, err := apiClient.DeployServer(server.Server.Name, deployVersion, config, deployPreferRemote, "local")
 	if err != nil {
 		return fmt.Errorf("failed to deploy server: %w", err)
 	}
