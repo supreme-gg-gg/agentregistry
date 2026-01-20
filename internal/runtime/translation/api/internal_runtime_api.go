@@ -1,5 +1,10 @@
 package api
 
+import (
+	v1alpha2 "github.com/kagent-dev/kagent/go/api/v1alpha2"
+	kmcpv1alpha1 "github.com/kagent-dev/kmcp/api/v1alpha1"
+)
+
 // DesiredState represents the desired set of MCPServevrs the user wishes to run locally
 type DesiredState struct {
 	MCPServers []*MCPServer `json:"mcpServers"`
@@ -112,5 +117,7 @@ const (
 )
 
 type KubernetesRuntimeConfig struct {
-	// TODO: add k8s config here
+	Agents           []*v1alpha2.Agent           `json:"agents"`
+	RemoteMCPServers []*v1alpha2.RemoteMCPServer `json:"remoteMCPServers"`
+	MCPServers       []*kmcpv1alpha1.MCPServer   `json:"mcpServers"`
 }

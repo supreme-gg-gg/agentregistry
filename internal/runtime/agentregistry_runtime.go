@@ -11,10 +11,121 @@ import (
 
 	"github.com/agentregistry-dev/agentregistry/internal/cli/agent/frameworks/common"
 	"github.com/agentregistry-dev/agentregistry/internal/runtime/translation/api"
+	"github.com/agentregistry-dev/agentregistry/internal/runtime/translation/kagent"
 	"github.com/agentregistry-dev/agentregistry/internal/runtime/translation/registry"
 
 	"go.yaml.in/yaml/v3"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/clientcmd"
 )
+
+// GVRs for kagent resources
+var (
+	agentGVR = schema.GroupVersionResource{
+		Group:    "kagent.dev",
+		Version:  "v1alpha2",
+		Resource: "agents",
+	}
+	remoteMCPGVR = schema.GroupVersionResource{
+		Group:    "kagent.dev",
+		Version:  "v1alpha2",
+		Resource: "remotemcpservers",
+	}
+	mcpServerGVR = schema.GroupVersionResource{
+		Group:    "kagent.dev",
+		Version:  "v1alpha1",
+		Resource: "mcpservers",
+	}
+)
+
+// newDynamicClient creates a Kubernetes dynamic client from kubeconfig.
+func newDynamicClient(verbose bool) (dynamic.Interface, error) {
+	kubeconfigPath := os.Getenv("KUBECONFIG")
+	if kubeconfigPath == "" {
+		if home := os.Getenv("HOME"); home != "" {
+			kubeconfigPath = filepath.Join(home, ".kube", "config")
+		}
+	}
+
+	if verbose {
+		fmt.Printf("Using kubeconfig: %s\n", kubeconfigPath)
+	}
+
+	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig from %s: %w", kubeconfigPath, err)
+	}
+
+	client, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	return client, nil
+}
+
+// applyResource creates or updates a Kubernetes resource using the dynamic client.
+func applyResource(
+	ctx context.Context,
+	client dynamic.Interface,
+	gvr schema.GroupVersionResource,
+	obj interface{},
+	name, namespace string,
+	verbose bool,
+) error {
+	unstructuredMap, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return fmt.Errorf("failed to convert to unstructured: %w", err)
+	}
+	unstructuredObj := &unstructured.Unstructured{Object: unstructuredMap}
+
+	if verbose {
+		fmt.Printf("Applying %s %s in namespace %s\n", gvr.Resource, name, namespace)
+	}
+
+	existing, err := client.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		// Update existing resource
+		unstructuredObj.SetResourceVersion(existing.GetResourceVersion())
+		_, err = client.Resource(gvr).Namespace(namespace).Update(ctx, unstructuredObj, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to update: %w", err)
+		}
+		if verbose {
+			fmt.Printf("Updated %s %s\n", gvr.Resource, name)
+		}
+	} else {
+		// Create new resource
+		_, err = client.Resource(gvr).Namespace(namespace).Create(ctx, unstructuredObj, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to create: %w", err)
+		}
+		if verbose {
+			fmt.Printf("Created %s %s\n", gvr.Resource, name)
+		}
+	}
+
+	return nil
+}
+
+// deleteResource deletes a Kubernetes resource, ignoring NotFound errors.
+func deleteResource(
+	ctx context.Context,
+	client dynamic.Interface,
+	gvr schema.GroupVersionResource,
+	name, namespace string,
+) error {
+	err := client.Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
 
 type AgentRegistryRuntime interface {
 	ReconcileAll(
@@ -99,7 +210,8 @@ func (r *agentRegistryRuntime) ensureRuntime(
 	switch cfg.Type {
 	case api.RuntimeConfigTypeLocal:
 		return r.ensureLocalRuntime(ctx, cfg.Local)
-	// TODO: Add a handler for other runtimes
+	case api.RuntimeConfigTypeKubernetes:
+		return r.ensureKubernetesRuntime(ctx, cfg.Kubernetes)
 	default:
 		return fmt.Errorf("unsupported runtime config type: %v", cfg.Type)
 	}
@@ -148,6 +260,107 @@ func (r *agentRegistryRuntime) ensureLocalRuntime(
 	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to start docker compose: %w", err)
+	}
+	return nil
+}
+
+func (r *agentRegistryRuntime) ensureKubernetesRuntime(
+	ctx context.Context,
+	cfg *api.KubernetesRuntimeConfig,
+) error {
+	if cfg == nil || (len(cfg.Agents) == 0 && len(cfg.RemoteMCPServers) == 0 && len(cfg.MCPServers) == 0) {
+		return nil
+	}
+
+	client, err := newDynamicClient(r.verbose)
+	if err != nil {
+		return err
+	}
+
+	for _, agent := range cfg.Agents {
+		namespace := agent.Namespace
+		if namespace == "" {
+			namespace = kagent.DefaultNamespace
+		}
+		if err := applyResource(ctx, client, agentGVR, agent, agent.Name, namespace, r.verbose); err != nil {
+			return fmt.Errorf("agent %s: %w", agent.Name, err)
+		}
+	}
+
+	for _, remoteMCP := range cfg.RemoteMCPServers {
+		namespace := remoteMCP.Namespace
+		if namespace == "" {
+			namespace = kagent.DefaultNamespace
+		}
+		if err := applyResource(ctx, client, remoteMCPGVR, remoteMCP, remoteMCP.Name, namespace, r.verbose); err != nil {
+			return fmt.Errorf("remote MCP server %s: %w", remoteMCP.Name, err)
+		}
+	}
+
+	for _, mcpServer := range cfg.MCPServers {
+		namespace := mcpServer.Namespace
+		if namespace == "" {
+			namespace = kagent.DefaultNamespace
+		}
+		mcpServer.Namespace = namespace
+		if err := applyResource(ctx, client, mcpServerGVR, mcpServer, mcpServer.Name, namespace, r.verbose); err != nil {
+			return fmt.Errorf("MCP server %s: %w", mcpServer.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// DeleteKubernetesAgent deletes a kagent Agent CR by name/version.
+func DeleteKubernetesAgent(ctx context.Context, name, version, namespace string, verbose bool) error {
+	if namespace == "" {
+		namespace = kagent.DefaultNamespace
+	}
+
+	client, err := newDynamicClient(verbose)
+	if err != nil {
+		return err
+	}
+
+	resourceName := kagent.AgentResourceName(name, version)
+	if err := deleteResource(ctx, client, agentGVR, resourceName, namespace); err != nil {
+		return fmt.Errorf("failed to delete agent %s: %w", resourceName, err)
+	}
+	return nil
+}
+
+// DeleteKubernetesRemoteMCPServer deletes a kagent RemoteMCPServer CR by name.
+func DeleteKubernetesRemoteMCPServer(ctx context.Context, name, namespace string, verbose bool) error {
+	if namespace == "" {
+		namespace = kagent.DefaultNamespace
+	}
+
+	client, err := newDynamicClient(verbose)
+	if err != nil {
+		return err
+	}
+
+	resourceName := kagent.RemoteMCPResourceName(name)
+	if err := deleteResource(ctx, client, remoteMCPGVR, resourceName, namespace); err != nil {
+		return fmt.Errorf("failed to delete remote MCP server %s: %w", resourceName, err)
+	}
+	return nil
+}
+
+// DeleteKubernetesMCPServer deletes a kagent MCPServer CR by name.
+func DeleteKubernetesMCPServer(ctx context.Context, name, namespace string, verbose bool) error {
+	if namespace == "" {
+		namespace = kagent.DefaultNamespace
+	}
+
+	client, err := newDynamicClient(verbose)
+	if err != nil {
+		return err
+	}
+
+	resourceName := kagent.MCPServerResourceName(name)
+	if err := deleteResource(ctx, client, mcpServerGVR, resourceName, namespace); err != nil {
+		return fmt.Errorf("failed to delete MCP server %s: %w", resourceName, err)
 	}
 	return nil
 }
