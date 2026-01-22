@@ -2,6 +2,7 @@ package kagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,12 +33,23 @@ func (t *translator) TranslateRuntimeConfig(
 	desired *api.DesiredState,
 ) (*api.AIRuntimeConfig, error) {
 	agents := make([]*v1alpha2.Agent, 0, len(desired.Agents))
+	configMaps := make([]*corev1.ConfigMap, 0)
+
 	for _, agent := range desired.Agents {
 		resource, err := t.translateAgent(agent)
 		if err != nil {
 			return nil, err
 		}
 		agents = append(agents, resource)
+
+		// Generate ConfigMap for agent's resolved MCP server connections
+		if len(agent.ResolvedMCPServers) > 0 {
+			configMap, err := t.translateAgentConfigMap(agent)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create ConfigMap for agent %s: %w", agent.Name, err)
+			}
+			configMaps = append(configMaps, configMap)
+		}
 	}
 
 	remoteMCPs := make([]*v1alpha2.RemoteMCPServer, 0)
@@ -71,6 +83,7 @@ func (t *translator) TranslateRuntimeConfig(
 			Agents:           agents,
 			RemoteMCPServers: remoteMCPs,
 			MCPServers:       mcpServers,
+			ConfigMaps:       configMaps,
 		},
 	}, nil
 }
@@ -101,6 +114,38 @@ func (t *translator) translateAgent(agent *api.Agent) (*v1alpha2.Agent, error) {
 		}
 	}
 
+	// Build SharedDeploymentSpec with optional ConfigMap volume mount for resolved MCP servers
+	sharedSpec := v1alpha2.SharedDeploymentSpec{
+		Env: envVars,
+	}
+
+	// If agent has resolved MCP servers, add ConfigMap volume mount
+	if len(agent.ResolvedMCPServers) > 0 {
+		configMapName := AgentConfigMapName(agent.Name, agent.Version)
+		volumeName := "mcp-config"
+
+		sharedSpec.Volumes = []corev1.Volume{{
+			Name: volumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: configMapName,
+					},
+					Items: []corev1.KeyToPath{{
+						Key:  "mcp-servers.json",
+						Path: "mcp-servers.json",
+					}},
+				},
+			},
+		}}
+
+		sharedSpec.VolumeMounts = []corev1.VolumeMount{{
+			Name:      volumeName,
+			MountPath: "/config",
+			ReadOnly:  true,
+		}}
+	}
+
 	return &v1alpha2.Agent{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "kagent.dev/v1alpha2",
@@ -115,10 +160,8 @@ func (t *translator) translateAgent(agent *api.Agent) (*v1alpha2.Agent, error) {
 			Type:        v1alpha2.AgentType_BYO,
 			BYO: &v1alpha2.BYOAgentSpec{
 				Deployment: &v1alpha2.ByoDeploymentSpec{
-					Image: agent.Deployment.Image,
-					SharedDeploymentSpec: v1alpha2.SharedDeploymentSpec{
-						Env: envVars,
-					},
+					Image:                agent.Deployment.Image,
+					SharedDeploymentSpec: sharedSpec,
 				},
 			},
 		},
@@ -206,6 +249,59 @@ func (t *translator) translateLocalMCPServer(server *api.MCPServer) (*kmcpv1alph
 		},
 		Spec: spec,
 	}, nil
+}
+
+// translateAgentConfigMap creates a ConfigMap containing the mcp-servers.json for an agent
+// This file is mounted into the agent's pod at /config/mcp-servers.json
+// The BYO agent then reads this file and connects to the MCP servers
+func (t *translator) translateAgentConfigMap(agent *api.Agent) (*corev1.ConfigMap, error) {
+	namespace := t.defaultNamespace
+	if value, ok := agent.Deployment.Env["KAGENT_NAMESPACE"]; ok && value != "" {
+		namespace = value
+	}
+
+	// Convert ResolvedMCPServers to JSON format expected by the Python agent
+	serversJSON, err := json.MarshalIndent(agent.ResolvedMCPServers, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal MCP servers config: %w", err)
+	}
+
+	configMapName := AgentConfigMapName(agent.Name, agent.Version)
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "agentregistry",
+				"app.kubernetes.io/component":  "agent-config",
+				"agentregistry.dev/agent":      sanitizeK8sName(agent.Name),
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kagent.dev/v1alpha2",
+					Kind:       "Agent",
+					Name:       AgentResourceName(agent.Name, agent.Version),
+				},
+			},
+		},
+		Data: map[string]string{
+			"mcp-servers.json": string(serversJSON),
+		},
+	}, nil
+}
+
+// AgentConfigMapName returns the ConfigMap name for an agent
+func AgentConfigMapName(name, version string) string {
+	base := fmt.Sprintf("%s-mcp-config", name)
+	if version != "" {
+		base = fmt.Sprintf("%s-%s-mcp-config", name, version)
+	}
+	return sanitizeK8sName(base)
 }
 
 func buildRemoteMCPURL(host string, port uint32, path string) string {

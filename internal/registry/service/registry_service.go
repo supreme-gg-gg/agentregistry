@@ -2,15 +2,10 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"maps"
-	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/agentregistry-dev/agentregistry/internal/cli/agent/frameworks/common"
@@ -18,7 +13,6 @@ import (
 	"github.com/agentregistry-dev/agentregistry/internal/registry/config"
 	"github.com/agentregistry-dev/agentregistry/internal/registry/database"
 	"github.com/agentregistry-dev/agentregistry/internal/registry/embeddings"
-	"github.com/agentregistry-dev/agentregistry/internal/registry/types"
 	"github.com/agentregistry-dev/agentregistry/internal/registry/validators"
 	"github.com/agentregistry-dev/agentregistry/internal/runtime"
 	"github.com/agentregistry-dev/agentregistry/internal/runtime/translation/dockercompose"
@@ -747,6 +741,34 @@ func (s *registryServiceImpl) DeployAgent(ctx context.Context, agentName, versio
 		return nil, err
 	}
 
+	// Resolve and create deployment records for registry-type MCP servers from agent manifest
+	resolvedServers, err := s.resolveAgentManifestMCPServers(ctx, &agentResp.Agent.AgentManifest)
+	if err != nil {
+		// Log warning but don't fail - agent deployment should still succeed
+		log.Printf("Warning: Failed to resolve MCP servers for agent %s: %v", agentName, err)
+	} else {
+		// Create deployment records for each resolved MCP server
+		for _, serverReq := range resolvedServers {
+			mcpDeployment := &models.Deployment{
+				ServerName:   serverReq.RegistryServer.Name,
+				Version:      serverReq.RegistryServer.Version,
+				Status:       "active",
+				Config:       make(map[string]string),
+				PreferRemote: serverReq.PreferRemote,
+				ResourceType: "mcp",
+				Runtime:      runtimeTarget,
+				DeployedAt:   time.Now(),
+				UpdatedAt:    time.Now(),
+			}
+			// Try to create deployment, but ignore if it already exists (idempotent)
+			if err := s.db.CreateDeployment(ctx, nil, mcpDeployment); err != nil {
+				if !errors.Is(err, database.ErrAlreadyExists) {
+					log.Printf("Warning: Failed to create deployment for MCP server %s: %v", serverReq.RegistryServer.Name, err)
+				}
+			}
+		}
+	}
+
 	// If reconciliation fails, remove the deployment that we just added
 	// This is required because reconciler uses the DB as the source of truth for desired state
 	if err := s.ReconcileAll(ctx); err != nil {
@@ -908,6 +930,14 @@ func (s *registryServiceImpl) ReconcileAll(ctx context.Context) error {
 				return fmt.Errorf("failed to resolve MCP servers for agent %s: %w", agentReq.RegistryAgent.Name, err)
 			}
 
+			// Propagate KAGENT_NAMESPACE from agent to resolved MCP servers
+			// so they deploy in the same namespace as the agent
+			if ns, ok := agentReq.EnvValues["KAGENT_NAMESPACE"]; ok && ns != "" {
+				for _, server := range resolvedServers {
+					server.EnvValues["KAGENT_NAMESPACE"] = ns
+				}
+			}
+
 			agentReq.ResolvedMCPServers = resolvedServers
 			requests.servers = append(requests.servers, resolvedServers...)
 			if s.cfg.Verbose && len(resolvedServers) > 0 {
@@ -946,28 +976,20 @@ func (s *registryServiceImpl) resolveAgentManifestMCPServers(ctx context.Context
 			continue
 		}
 
-		// Determine registry URL
-		registryURL := mcpServer.RegistryURL
-		if registryURL == "" {
-			registryURL = "http://127.0.0.1:12121"
-		}
-
 		version := mcpServer.RegistryServerVersion
 		if version == "" {
 			version = "latest"
 		}
 
-		serverEntry, err := fetchServerFromRegistry(registryURL, mcpServer.RegistryServerName, version)
+		// Use the registry service's own database instead of making HTTP calls
+		serverResp, err := s.GetServerByNameAndVersion(ctx, mcpServer.RegistryServerName, version, true)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch server %q from registry %s: %w", mcpServer.RegistryServerName, registryURL, err)
+			return nil, fmt.Errorf("failed to get server %q version %s from registry database: %w", mcpServer.RegistryServerName, version, err)
 		}
-
-		// Convert registry.ServerSpec to apiv0.ServerJSON
-		serverJSON := convertServerSpecToServerJSON(&serverEntry.Server)
 
 		// Create MCPServerRunRequest so that this resolved server is ran/deployed
 		resolvedServers = append(resolvedServers, &registry.MCPServerRunRequest{
-			RegistryServer: serverJSON,
+			RegistryServer: &serverResp.Server,
 			PreferRemote:   mcpServer.RegistryServerPreferRemote,
 			EnvValues:      make(map[string]string),
 			ArgValues:      make(map[string]string),
@@ -976,104 +998,4 @@ func (s *registryServiceImpl) resolveAgentManifestMCPServers(ctx context.Context
 	}
 
 	return resolvedServers, nil
-}
-
-// fetchServerFromRegistry fetches a server from a registry via HTTP
-func fetchServerFromRegistry(baseURL string, name string, version string) (*types.ServerEntry, error) {
-	// Construct the endpoint: /v0/servers/{serverName}/versions/{version}
-	baseURL = strings.TrimSuffix(baseURL, "/")
-	if !strings.HasSuffix(baseURL, "/v0/servers") {
-		baseURL = baseURL + "/v0/servers"
-	}
-
-	if version == "" {
-		version = "latest"
-	}
-
-	encodedName := url.PathEscape(name)
-	fetchURL := fmt.Sprintf("%s/%s/versions/%s", baseURL, encodedName, version)
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	resp, err := client.Get(fetchURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch server by name: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
-	}
-
-	var registryResp types.RegistryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&registryResp); err != nil {
-		return nil, fmt.Errorf("failed to decode server list response: %w", err)
-	}
-
-	if len(registryResp.Servers) != 1 {
-		return nil, fmt.Errorf("expected 1 server, got %d: %s with version %s", len(registryResp.Servers), name, version)
-	}
-
-	return &registryResp.Servers[0], nil
-}
-
-// convertServerSpecToServerJSON converts a types.ServerSpec to apiv0.ServerJSON
-func convertServerSpecToServerJSON(spec *types.ServerSpec) *apiv0.ServerJSON {
-	// Convert Repository - apiv0.ServerJSON uses model.Repository
-	var repo *model.Repository
-	if spec.Repository.URL != "" || spec.Repository.Source != "" {
-		repo = &model.Repository{
-			URL:    spec.Repository.URL,
-			Source: spec.Repository.Source, // Source is a string in model.Repository
-		}
-	}
-
-	return &apiv0.ServerJSON{
-		// ServerSpec doesn't include schema
-		// TODO(infocus7): Should we use model.CurrentSchemaURL? Or should we return the schema from the ServerEntry?
-		// In raw JSON, it's "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json", so would maybe need to parse it.
-		Schema:      "",
-		Name:        spec.Name,
-		Title:       spec.Title,
-		Description: spec.Description,
-		Version:     spec.Version,
-		WebsiteURL:  spec.WebsiteURL,
-		Repository:  repo,
-		Packages:    spec.Packages,
-		Remotes:     spec.Remotes,
-		// ServerSpec doesn't include meta
-		Icons: nil,
-		Meta:  nil,
-	}
-}
-
-func (s *registryServiceImpl) ensureSemanticEmbedding(ctx context.Context, opts *database.SemanticSearchOptions) error {
-	if opts == nil {
-		return nil
-	}
-	if len(opts.QueryEmbedding) > 0 {
-		return nil
-	}
-	if strings.TrimSpace(opts.RawQuery) == "" {
-		return fmt.Errorf("%w: semantic search requires a non-empty search string", database.ErrInvalidInput)
-	}
-	if s.embeddingsProvider == nil {
-		return fmt.Errorf("%w: semantic search provider is not configured", database.ErrInvalidInput)
-	}
-
-	result, err := s.embeddingsProvider.Generate(ctx, embeddings.Payload{
-		Text: opts.RawQuery,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to generate semantic embedding: %w", err)
-	}
-
-	if s.cfg != nil && s.cfg.Embeddings.Dimensions > 0 && len(result.Vector) != s.cfg.Embeddings.Dimensions {
-		return fmt.Errorf("%w: embedding dimensions mismatch (expected %d, got %d)", database.ErrInvalidInput, s.cfg.Embeddings.Dimensions, len(result.Vector))
-	}
-
-	opts.QueryEmbedding = result.Vector
-	return nil
 }

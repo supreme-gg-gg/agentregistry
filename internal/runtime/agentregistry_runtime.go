@@ -139,16 +139,40 @@ func (r *agentRegistryRuntime) ReconcileAll(
 		if err != nil {
 			return fmt.Errorf("translate agent %s: %w", req.RegistryAgent.Name, err)
 		}
+
+		// Translate and add resolved MCP servers from agent manifest to desired state
+		for _, serverReq := range req.ResolvedMCPServers {
+			mcpServer, err := r.registryTranslator.TranslateMCPServer(context.TODO(), serverReq)
+			if err != nil {
+				return fmt.Errorf("translate resolved MCP server %s for agent %s: %w", serverReq.RegistryServer.Name, req.RegistryAgent.Name, err)
+			}
+			desiredState.MCPServers = append(desiredState.MCPServers, mcpServer)
+		}
+
+		// Populate ResolvedMCPServers on the agent for ConfigMap generation
+		resolvedConfigs := createResolvedMCPServerConfigs(req.ResolvedMCPServers)
+		agent.ResolvedMCPServers = resolvedConfigs
+
 		desiredState.Agents = append(desiredState.Agents, agent)
 
-		serversForConfig := pythonServersFromServerRunRequests(req.ResolvedMCPServers)
+		// Convert back to PythonMCPServer for local runtime backward compatibility
+		var pythonServers []common.PythonMCPServer
+		for _, cfg := range resolvedConfigs {
+			pythonServers = append(pythonServers, common.PythonMCPServer{
+				Name:    cfg.Name,
+				Type:    cfg.Type,
+				URL:     cfg.URL,
+				Headers: cfg.Headers,
+			})
+		}
+
 		if err := common.RefreshMCPConfig(
 			&common.MCPConfigTarget{
 				BaseDir:   r.runtimeDir,
 				AgentName: req.RegistryAgent.Name,
 				Version:   req.RegistryAgent.Version,
 			},
-			serversForConfig,
+			pythonServers,
 			r.verbose,
 		); err != nil {
 			return fmt.Errorf("failed to refresh resolved MCP server config for agent %s: %w", req.RegistryAgent.Name, err)
@@ -239,6 +263,16 @@ func (r *agentRegistryRuntime) ensureKubernetesRuntime(
 	c, err := newClient(r.verbose)
 	if err != nil {
 		return err
+	}
+
+	// Apply ConfigMaps first
+	for _, configMap := range cfg.ConfigMaps {
+		if configMap.Namespace == "" {
+			configMap.Namespace = kagent.DefaultNamespace
+		}
+		if err := applyResource(ctx, c, configMap, r.verbose); err != nil {
+			return fmt.Errorf("ConfigMap %s: %w", configMap.Name, err)
+		}
 	}
 
 	for _, agent := range cfg.Agents {
@@ -334,13 +368,13 @@ func DeleteKubernetesMCPServer(ctx context.Context, name, namespace string, verb
 	return nil
 }
 
-// pythonServersFromServerRunRequests converts server run requests into Python MCP server structs.
-func pythonServersFromServerRunRequests(requests []*registry.MCPServerRunRequest) []common.PythonMCPServer {
+// createResolvedMCPServerConfigs converts server run requests into API ResolvedMCPServerConfig
+func createResolvedMCPServerConfigs(requests []*registry.MCPServerRunRequest) []api.ResolvedMCPServerConfig {
 	if len(requests) == 0 {
 		return nil
 	}
 
-	var mcpServers []common.PythonMCPServer
+	var configs []api.ResolvedMCPServerConfig
 	for _, serverReq := range requests {
 		server := serverReq.RegistryServer
 		// Skip servers with no remotes or packages
@@ -348,15 +382,15 @@ func pythonServersFromServerRunRequests(requests []*registry.MCPServerRunRequest
 			continue
 		}
 
-		pythonServer := common.PythonMCPServer{
-			Name: server.Name,
+		config := api.ResolvedMCPServerConfig{
+			Name: registry.GenerateInternalName(server.Name),
 		}
 
 		useRemote := len(server.Remotes) > 0 && (serverReq.PreferRemote || len(server.Packages) == 0)
 		if useRemote {
 			remote := server.Remotes[0]
-			pythonServer.Type = "remote"
-			pythonServer.URL = remote.URL
+			config.Type = "remote"
+			config.URL = remote.URL
 
 			if len(remote.Headers) > 0 || len(serverReq.HeaderValues) > 0 {
 				headers := make(map[string]string)
@@ -365,16 +399,16 @@ func pythonServersFromServerRunRequests(requests []*registry.MCPServerRunRequest
 				}
 				maps.Copy(headers, serverReq.HeaderValues)
 				if len(headers) > 0 {
-					pythonServer.Headers = headers
+					config.Headers = headers
 				}
 			}
 		} else {
-			pythonServer.Type = "command"
-			// For command type, Python derives URL as http://{server_name}:3000/mcp
+			// For command type, URL is derived internally by the client (http://{server_name}:port)
+			config.Type = "command"
 		}
 
-		mcpServers = append(mcpServers, pythonServer)
+		configs = append(configs, config)
 	}
 
-	return mcpServers
+	return configs
 }
