@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
 	"github.com/modelcontextprotocol/registry/pkg/model"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const maxServerVersionsPerServer = 10000
@@ -838,6 +839,12 @@ func (s *registryServiceImpl) RemoveServer(ctx context.Context, serverName strin
 	return nil
 }
 
+// RemoveAgent removes an agent deployment
+func (s *registryServiceImpl) RemoveAgent(ctx context.Context, agentName string, version string) error {
+	// Use RemoveServer implementation as it handles both types based on deployment record
+	return s.RemoveServer(ctx, agentName, version)
+}
+
 // ReconcileAll fetches all deployments from database and reconciles containers
 // This implements the Reconciler interface
 func (s *registryServiceImpl) ReconcileAll(ctx context.Context) error {
@@ -1034,12 +1041,41 @@ func (s *registryServiceImpl) ensureSemanticEmbedding(ctx context.Context, opts 
 func (s *registryServiceImpl) ListKubernetesDeployments(ctx context.Context, namespace string) ([]models.KubernetesResource, error) {
 	var resources []models.KubernetesResource
 
-	// Helper to check if a resource is managed by the registry (has the managed label)
+	// Helper to check if a resource is managed by the registry
 	isManaged := func(labels map[string]string) bool {
-		if labels == nil {
-			return false
+		return labels != nil && labels["agentregistry.io/managed"] == "true"
+	}
+
+	// Helper to append a generic resource to the list
+	addResource := func(
+		resType, name, ns string,
+		labels map[string]string,
+		creation time.Time,
+		conditions []metav1.Condition,
+		readyConditionType, readyState, notReadyState string,
+	) {
+		createdAt := creation.Format(time.RFC3339)
+		status := ""
+		for _, cond := range conditions {
+			if cond.Type == readyConditionType {
+				if cond.Status == metav1.ConditionTrue {
+					status = readyState
+				} else {
+					status = notReadyState
+				}
+				break
+			}
 		}
-		return labels["agentregistry.io/managed"] == "true"
+
+		resources = append(resources, models.KubernetesResource{
+			Type:       resType,
+			Name:       name,
+			Namespace:  ns,
+			Labels:     labels,
+			Status:     status,
+			CreatedAt:  &createdAt,
+			IsExternal: !isManaged(labels),
+		})
 	}
 
 	// List agents from Kubernetes
@@ -1048,30 +1084,7 @@ func (s *registryServiceImpl) ListKubernetesDeployments(ctx context.Context, nam
 		log.Printf("Warning: Failed to list agents from Kubernetes: %v", err)
 	} else {
 		for _, agent := range agents {
-			createdAt := agent.CreationTimestamp.Format(time.RFC3339)
-
-			// Derive status from conditions
-			status := ""
-			for _, cond := range agent.Status.Conditions {
-				if cond.Type == "Ready" {
-					if cond.Status == "True" {
-						status = "Ready"
-					} else {
-						status = "NotReady"
-					}
-					break
-				}
-			}
-
-			resources = append(resources, models.KubernetesResource{
-				Type:       "agent",
-				Name:       agent.Name,
-				Namespace:  agent.Namespace,
-				Labels:     agent.Labels,
-				Status:     status,
-				CreatedAt:  &createdAt,
-				IsExternal: !isManaged(agent.Labels),
-			})
+			addResource("agent", agent.Name, agent.Namespace, agent.Labels, agent.CreationTimestamp.Time, agent.Status.Conditions, "Ready", "Ready", "NotReady")
 		}
 	}
 
@@ -1081,30 +1094,7 @@ func (s *registryServiceImpl) ListKubernetesDeployments(ctx context.Context, nam
 		log.Printf("Warning: Failed to list MCP servers from Kubernetes: %v", err)
 	} else {
 		for _, mcp := range mcpServers {
-			createdAt := mcp.CreationTimestamp.Format(time.RFC3339)
-
-			// Derive status from conditions
-			status := ""
-			for _, cond := range mcp.Status.Conditions {
-				if cond.Type == "Accepted" {
-					if cond.Status == "True" {
-						status = "Accepted"
-					} else {
-						status = "Pending"
-					}
-					break
-				}
-			}
-
-			resources = append(resources, models.KubernetesResource{
-				Type:       "mcpserver",
-				Name:       mcp.Name,
-				Namespace:  mcp.Namespace,
-				Labels:     mcp.Labels,
-				Status:     status,
-				CreatedAt:  &createdAt,
-				IsExternal: !isManaged(mcp.Labels),
-			})
+			addResource("mcpserver", mcp.Name, mcp.Namespace, mcp.Labels, mcp.CreationTimestamp.Time, mcp.Status.Conditions, "Accepted", "Accepted", "Pending")
 		}
 	}
 
@@ -1114,19 +1104,10 @@ func (s *registryServiceImpl) ListKubernetesDeployments(ctx context.Context, nam
 		log.Printf("Warning: Failed to list remote MCP servers from Kubernetes: %v", err)
 	} else {
 		for _, remoteMCP := range remoteMCPs {
-			createdAt := remoteMCP.CreationTimestamp.Format(time.RFC3339)
-
-			resources = append(resources, models.KubernetesResource{
-				Type:       "remotemcpserver",
-				Name:       remoteMCP.Name,
-				Namespace:  remoteMCP.Namespace,
-				Labels:     remoteMCP.Labels,
-				Status:     "", // RemoteMCPServer may not have status
-				CreatedAt:  &createdAt,
-				IsExternal: !isManaged(remoteMCP.Labels),
-			})
+			addResource("remotemcpserver", remoteMCP.Name, remoteMCP.Namespace, remoteMCP.Labels, remoteMCP.CreationTimestamp.Time, remoteMCP.Status.Conditions, "Accepted", "Accepted", "Pending")
 		}
 	}
 
 	return resources, nil
 }
+
